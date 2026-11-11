@@ -1,0 +1,14 @@
+[Unit]
+Description=Qwen inference on AMD Instinct MI210
+After=network-online.target
+
+[Service]
+Type=simple
+User=qwen
+EnvironmentFile=/etc/qwen-mi210.env
+ExecStart=/opt/mi210-qwen-deploy/scripts/serve.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
