@@ -1,0 +1,70 @@
+diff --git a/ggml/src/ggml-cuda/chunk_gated_delta_net.cu b/ggml/src/ggml-cuda/chunk_gated_delta_net.cu
+index a0299e3..c4e8c45 100644
+--- a/ggml/src/ggml-cuda/chunk_gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/chunk_gated_delta_net.cu
+@@ -11,6 +11,11 @@
+ #ifdef GGML_USE_HIP
+ #include <cmath>
+ 
++// Keep normalized Q/QK products away from half denormals on CDNA2.
++// This is an exact binary exponent shift; undo it only in the FP32 result.
++static constexpr float cgdr_q_scale = 0x1p8f;
++static constexpr float cgdr_q_inv_scale = 0x1p-8f;
++
+ // Tensor-core backend for the chunked-GDN GEMMs, Default nvcuda::wmma (fastest on NVIDIA).
+ // And ggml_cuda_mma API is used on HIP/MUSA.
+ #if defined(GGML_CUDA_GDN_FORCE_MMA) || defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+@@ -359,7 +364,7 @@ __launch_bounds__(ggml_cuda_get_physical_warp_size(), 8) __global__ void cgdr_pr
+         const int   row = i / BK, col = i % BK;
+         const float qv = (row < valid_cs) ? Q_chunk[(long long) row * HK + col] : 0.f;
+         const float kv = (row < valid_cs) ? K_chunk[(long long) row * HK + col] : 0.f;
+-        s_Q[i]         = __float2half(qv * scale);
++        s_Q[i]         = __float2half(qv * (scale * cgdr_q_scale));
+         s_K[i]         = __float2half(kv);
+     }
+     __syncthreads();
+@@ -376,7 +381,7 @@ __launch_bounds__(ggml_cuda_get_physical_warp_size(), 8) __global__ void cgdr_pr
+     for (int flat = tid; flat < CS * CS; flat += blockDim.x) {
+         const int row  = flat / CS;
+         const int col  = flat % CS;
+-        O_base[flat]   = (col <= row) ? s_acc[flat] * __expf(s_gcum[row] - s_gcum[col]) : 0.f;
++        O_base[flat]   = (col <= row) ? s_acc[flat] * (cgdr_q_inv_scale * __expf(s_gcum[row] - s_gcum[col])) : 0.f;
+     }
+ #else
+     (void) Q_raw;
+@@ -544,7 +549,7 @@ __launch_bounds__(NT, OCC) __global__ void cgdr_state_wmma_kernel(
+         for (int i = tid; i < CS * BK; i += NT) {
+             const int   t = i / BK, k = i % BK;
+             const float qv = (t < valid_cs) ? qraw_chunk[(long long) t * HK + k] : 0.f;
+-            s_kbuf[i] = cgdr_to_fp16(qv * scale);
++            s_kbuf[i] = cgdr_to_fp16(qv * (scale * cgdr_q_scale));
+         }
+ 
+         __syncthreads();
+@@ -562,7 +567,7 @@ __launch_bounds__(NT, OCC) __global__ void cgdr_state_wmma_kernel(
+             const int idx   = tid + j * NT;
+             const int t_idx = idx / BV;
+             const int v_loc = idx % BV;
+-            oi_regs[j] = s_result[t_idx * BV + v_loc] * __expf(fminf(s_gcum[t_idx], 88.72f));
++            oi_regs[j] = s_result[t_idx * BV + v_loc] * (cgdr_q_inv_scale * __expf(fminf(s_gcum[t_idx], 88.72f)));
+         }
+ 
+         // Step 3: K_raw -> s_kch fp16 (row-major [CS][BK], decay-scaled by exp(g_last-g_cum[t]))
+@@ -607,7 +612,7 @@ __launch_bounds__(NT, OCC) __global__ void cgdr_state_wmma_kernel(
+             __half *      s_qkb   = reinterpret_cast<__half *>(s_kbuf);  // reuse kbuf: [CS][CS] fp16
+             const float * qk_base = QK_buf + (bh_off * (long long) num_chunks + ci) * CS * CS;
+             for (int i = tid; i < CS * CS; i += NT) {
+-                s_qkb[i] = cgdr_to_fp16(qk_base[i]);
++                s_qkb[i] = cgdr_to_fp16(qk_base[i] * cgdr_q_scale);
+             }
+             __syncthreads();
+ 
+@@ -626,7 +631,7 @@ __launch_bounds__(NT, OCC) __global__ void cgdr_state_wmma_kernel(
+                 const int t_p = idx / BV;
+                 const int v_p = idx % BV;
+                 if (t_p < valid_cs) {
+-                    out_chunk[(long long) t_p * H * V_dim + v_p] = s_hdelta[t_p * BV + v_p] + oi_regs[j];
++                    out_chunk[(long long) t_p * H * V_dim + v_p] = s_hdelta[t_p * BV + v_p] * cgdr_q_inv_scale + oi_regs[j];
+                 }
+             }
+         }
