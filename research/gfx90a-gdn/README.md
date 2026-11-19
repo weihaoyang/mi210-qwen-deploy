@@ -18,3 +18,14 @@ c++ -std=c++17 -O2 -I/path/to/llama.cpp/ggml/src/ggml-cuda \
 ```
 
 The separate `gfx90a-gdn-device.cpp` links GGML (`-lggml -lggml-base`) and accepts an explicit backend name, Q/K head count and V head count. Compare the recurrent control and candidate only on a dedicated authorized device. Do not increase the threshold. No hypothesis about production latency follows from this test.
+
+## Precision follow-up: source compiled, device validation pending
+
+[AMD MI200 ISA, Table 25](https://developer.amd.com/wp-content/resources/CDNA2_Shader_ISA_18November2021.pdf) specifies that the actual F16 MFMA op flushes denormals. The CPU-only `localize-rounding.cpp` samples 24 synthetic head/value rows at the same fixture geometry. Ordinary half conversion gives first-fixture output NMSE 6.26e-8; flushing converted-half operands gives 2.59e-6 with state 3.09e-8, close to the device's 2.28e-6 output and 3.19e-8 state. The intra-chunk QK × innovation contributes 2.21e-6 alone in the flush model. This is evidence for the error mechanism, not a device measurement of the correction.
+
+`0002-gfx90a-qk-half-rescale-experiment.patch` (apply after the first patch using `git apply --check`) multiplies only the small Q/QK operands by 256 before half conversion, then applies the exact inverse shift in the FP32 outputs. It preserves the state update and the existing dispatch/threshold. In the flush model, the two synthetic fixtures' output NMSE falls to 6.39e-8 and 7.63e-8. The exact follow-up object and HIP library compiled and linked for gfx90a/ROCm 7.2.4, without running its kernels. Keep it disabled until the unchanged device numerical gate passes with fresh, continued and reset state; model-level performance remains unmeasured.
+
+```sh
+clang++ -O2 -std=c++17 -Wall -Wextra -Werror localize-rounding.cpp -o ./localize-rounding
+./localize-rounding
+```
